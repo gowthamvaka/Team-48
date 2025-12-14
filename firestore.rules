@@ -1,0 +1,188 @@
+rules_version = '2';
+
+/**
+ * @file firestore.rules
+ * @description Security rules for the FinLit application.
+ *
+ * ## Core Philosophy
+ * This ruleset enforces a strict security model centered around user ownership and explicit sharing. Data is either private to a user, shared among a defined group of collaborators, or entirely public. The default posture is to deny access.
+ *
+ * ## Data Structure
+ * - `/users/{userId}`: Contains private user profiles and nested subcollections for personal financial data (goals, transactions). All access is restricted to the owning user.
+ * - `/trips/{tripId}`: A top-level collection for collaborative trip planning. Access is managed by a `members` map denormalized onto each trip document.
+ * - `/financialConcepts/{conceptId}`: A public, read-only collection of financial information, accessible to all users.
+ *
+ * ## Key Security Decisions
+ * - **User Data Privacy**: All data under `/users/{userId}` is strictly private. Rules prevent one user from seeing another user's profile, financial goals, or transactions. Listing the top-level `/users` collection is disabled.
+ * - **Collaborative Trips**: The `/trips` collection uses a denormalized `members` map on each document to grant access. This avoids slow and costly cross-document reads in rules, making security checks fast and efficient. Only the trip's creator can modify or delete the trip.
+ * - **Subcollection Security**: Access to subcollections like `/trips/{tripId}/tripExpenses` is secured by checking permissions on the parent `trip` document.
+ * - **Public Data**: The `/financialConcepts` collection is globally readable but client writes are disabled to protect its integrity.
+ * - **Prototyping Flexibility**: These rules enforce strict authorization (who can access what) but do not validate the specific shape or type of data being written, allowing for rapid front-end development and iteration.
+ */
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------------------
+    // Helper Functions
+    // ------------------------------------------------------------------------
+
+    /**
+     * Checks if a user is authenticated.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * Checks if the currently authenticated user is the owner of a resource.
+     * @param userId The UID to check against the request's auth UID.
+     */
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    /**
+     * Checks if a document currently exists in Firestore.
+     */
+    function isExistingDoc() {
+      return resource != null;
+    }
+
+    /**
+     * Checks if the current user is the owner of an existing document.
+     * Used for safe updates and deletes.
+     * @param userId The UID to check against the request's auth UID.
+     */
+    function isExistingOwner(userId) {
+      return isOwner(userId) && isExistingDoc();
+    }
+
+    /**
+     * Checks if the user is a member of the parent trip by reading the trip document.
+     * This is required to secure subcollections based on parent permissions.
+     * NOTE: This function performs a 'get' operation, which has a cost implication.
+     * @param tripId The document ID of the parent trip.
+     */
+    function isParentTripMember(tripId) {
+      return isSignedIn() && get(/databases/$(database)/documents/trips/$(tripId)).data.members[request.auth.uid] != null;
+    }
+
+    /**
+     * Checks if the user is the creator of an existing trip document.
+     */
+    function isTripCreator() {
+      return isSignedIn() && isExistingDoc() && request.auth.uid == resource.data.createdBy;
+    }
+
+    /**
+     * Checks if the user is a member of an existing trip document.
+     * Assumes the trip document has a `members` map.
+     */
+    function isTripMember() {
+      return isSignedIn() && isExistingDoc() && resource.data.members[request.auth.uid] != null;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // User Data Collections (/users)
+    // ------------------------------------------------------------------------
+
+    /**
+     * @description Manages user profiles. A user can create their own profile, but can only read, update, or delete their own. Listing all users is disallowed.
+     * @path /users/{userId}
+     * @allow (create) An authenticated user creating their own user profile document, where the document ID matches their UID. `auth.uid: 'user_abc'`, `path: /users/user_abc`
+     * @deny (get) A user trying to read another user's profile. `auth.uid: 'user_xyz'`, `path: /users/user_abc`
+     * @principle Restricts access to a user's own data tree and enforces self-creation.
+     */
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if false;
+      allow create: if isOwner(userId) && request.resource.data.id == userId;
+      allow update: if isExistingOwner(userId) && request.resource.data.id == resource.data.id;
+      allow delete: if isExistingOwner(userId);
+
+      /**
+       * @description Manages a user's private financial goals. Access is inherited from the parent user document.
+       * @path /users/{userId}/financialGoals/{financialGoalId}
+       * @allow (create, get, list, update, delete) A user managing their own financial goals. `auth.uid: 'user_abc'`, `path: /users/user_abc/financialGoals/goal_123`
+       * @deny (get) A user trying to read another user's goals. `auth.uid: 'user_xyz'`, `path: /users/user_abc/financialGoals/goal_123`
+       * @principle Enforces document ownership via a hierarchical path.
+       */
+      match /financialGoals/{financialGoalId} {
+        allow get, list: if isOwner(userId);
+        allow create: if isOwner(userId) && request.resource.data.userId == userId;
+        allow update: if isExistingOwner(userId) && request.resource.data.userId == resource.data.userId;
+        allow delete: if isExistingOwner(userId);
+      }
+
+      /**
+       * @description Manages a user's private transactions. Access is inherited from the parent user document.
+       * @path /users/{userId}/transactions/{transactionId}
+       * @allow (create, get, list, update, delete) A user managing their own transactions. `auth.uid: 'user_abc'`, `path: /users/user_abc/transactions/txn_123`
+       * @deny (get) A user trying to read another user's transactions. `auth.uid: 'user_xyz'`, `path: /users/user_abc/transactions/txn_123`
+       * @principle Enforces document ownership via a hierarchical path.
+       */
+      match /transactions/{transactionId} {
+        allow get, list: if isOwner(userId);
+        allow create: if isOwner(userId) && request.resource.data.userId == userId;
+        allow update: if isExistingOwner(userId) && request.resource.data.userId == resource.data.userId;
+        allow delete: if isExistingOwner(userId);
+      }
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Collaborative Data Collections (/trips)
+    // ------------------------------------------------------------------------
+
+    /**
+     * @description Manages collaborative trips. Access is controlled by a `members` map on the document. Any member can read the trip, but only the creator can update or delete it.
+     * @path /trips/{tripId}
+     * @allow (get) A user who is listed in the trip's `members` map reading the document. `auth.uid: 'user_abc'`, `doc.data: { members: { 'user_abc': 'editor' } }`
+     * @deny (update) A trip member who is not the creator trying to update the trip. `auth.uid: 'user_abc'`, `doc.data: { createdBy: 'user_xyz' }`
+     * @principle Enforces shared access via a denormalized membership list on the document, avoiding costly lookups.
+     */
+    match /trips/{tripId} {
+      allow get: if isTripMember();
+      allow list: if false; // Deny listing all trips; client must query for trips they are a member of.
+      // On create, user must be the creator and must be included in the initial members map.
+      allow create: if isSignedIn() && request.resource.data.createdBy == request.auth.uid && request.auth.uid in request.resource.data.members;
+      // Only the original creator can update or delete the trip. `createdBy` field is immutable.
+      allow update: if isTripCreator() && request.resource.data.createdBy == resource.data.createdBy;
+      allow delete: if isTripCreator();
+
+      /**
+       * @description Manages expenses for a trip. Access is granted to any member of the parent trip.
+       * @path /trips/{tripId}/tripExpenses/{tripExpenseId}
+       * @allow (create, get, list) Any user in the parent trip's `members` map managing expenses. `auth.uid: 'user_abc'`, parent trip has `members: { 'user_abc': 'editor' }`.
+       * @deny (get) A user not in the parent trip's `members` map reading an expense.
+       * @principle Secures a subcollection by checking permissions on the parent document.
+       */
+      match /tripExpenses/{tripExpenseId} {
+        allow get, list: if isParentTripMember(tripId);
+        allow create: if isParentTripMember(tripId) && request.resource.data.tripId == tripId;
+        allow update: if isParentTripMember(tripId) && isExistingDoc() && request.resource.data.tripId == resource.data.tripId;
+        allow delete: if isParentTripMember(tripId) && isExistingDoc();
+      }
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Public Data Collections (/financialConcepts)
+    // ------------------------------------------------------------------------
+
+    /**
+     * @description Stores public financial concepts for the app's AI mentor. This data is readable by anyone but cannot be modified by clients.
+     * @path /financialConcepts/{financialConceptId}
+     * @allow (get, list) Any user (authenticated or not) reading financial concepts.
+     * @deny (create, update, delete) Any client trying to write to the collection.
+     * @principle Provides public read access for non-sensitive data while preventing client-side modification.
+     */
+    match /financialConcepts/{financialConceptId} {
+      allow get, list: if true;
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+  }
+}
